@@ -1,0 +1,182 @@
+from PIL import Image
+import io
+import base64
+import os
+import zipfile
+import shutil
+import xml.etree.ElementTree as ET
+from lxml import etree
+
+def compress_image(image_data, max_side_px, jpeg_quality, force_convert_to_jpeg):
+    """Сжимает изображение с сохранением пропорций"""
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        if max(img.size) <= max_side_px and not force_convert_to_jpeg:
+            return image_data
+        
+        img.thumbnail((max_side_px, max_side_px), Image.LANCZOS)
+        output = io.BytesIO()
+        
+        if force_convert_to_jpeg:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(output, format="JPEG", quality=jpeg_quality)
+        else:
+            img.save(output, format=img.format)
+            
+        return output.getvalue()
+    except Exception as e:
+        print(f"Ошибка обработки изображения: {e}")
+        return None
+
+def process_fb2_file(input_path, output_path, max_side_px, jpeg_quality, force_convert_to_jpeg):
+    """Обрабатывает FB2 файл"""
+    try:
+        parser = etree.XMLParser(remove_blank_text=True)
+        tree = etree.parse(input_path, parser)
+        root = tree.getroot()
+        ns = {"fb2": "http://www.gribuser.ru/xml/fictionbook/2.0"}
+        
+        for binary in root.xpath("//fb2:binary", namespaces=ns):
+            content_type = binary.get("content-type", "")
+            if not content_type.startswith("image/"):
+                continue
+                
+            try:
+                image_base64 = binary.text.strip()
+                image_data = base64.b64decode(image_base64)
+                compressed_data = compress_image(image_data, max_side_px, jpeg_quality, force_convert_to_jpeg)
+                
+                if compressed_data:
+                    new_base64 = base64.b64encode(compressed_data).decode("ascii")
+                    binary.text = "\n" + new_base64 + "\n"
+            except Exception as e:
+                print(f"Ошибка обработки binary: {e}")
+                continue
+                
+        tree.write(output_path, encoding="utf-8", xml_declaration=True, pretty_print=True)
+        return True
+        
+    except Exception as e:
+        print(f"Ошибка обработки FB2 файла {input_path}: {e}")
+        return False
+
+def process_epub_file(input_path, output_path, max_side_px, jpeg_quality, force_convert_to_jpeg):
+    """Обрабатывает EPUB файл"""
+    try:
+        # Создаем временную папку
+        temp_dir = os.path.join(os.path.dirname(output_path), "temp_epub")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Распаковываем EPUB
+        with zipfile.ZipFile(input_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        
+        # Обрабатываем все изображения
+        for root, _, files in os.walk(temp_dir):
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'rb') as f:
+                            image_data = f.read()
+                        
+                        compressed_data = compress_image(image_data, max_side_px, jpeg_quality, force_convert_to_jpeg)
+                        
+                        if compressed_data:
+                            with open(file_path, 'wb') as f:
+                                f.write(compressed_data)
+                    except Exception as e:
+                        print(f"Ошибка обработки {file}: {e}")
+        
+        # Создаем новый EPUB
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(temp_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, temp_dir)
+                    zipf.write(file_path, arcname)
+        
+        # Удаляем временную папку
+        shutil.rmtree(temp_dir)
+        return True
+        
+    except Exception as e:
+        print(f"Ошибка обработки EPUB файла {input_path}: {e}")
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        return False
+
+def get_user_input():
+    """Получает параметры от пользователя"""
+    print("\n=== Оптимизатор электронных книг ===")
+    print("Поддерживаемые форматы: FB2, EPUB\n")
+    
+    # Запрос пути к папке
+    while True:
+        input_folder = input("Введите путь к папке с файлами: ").strip()
+        if os.path.isdir(input_folder):
+            break
+        print("Ошибка: папка не найдена. Попробуйте еще раз.")
+    
+    # Создаем папку для результатов
+    output_folder = input_folder.rstrip("\\/") + "_optimized"
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Запрос параметров обработки
+    while True:
+        try:
+            max_side = int(input("Максимальный размер по большей стороне (пикселей, 600-2000): ") or 1200)
+            if 600 <= max_side <= 2000:
+                break
+            print("Введите значение от 600 до 2000")
+        except ValueError:
+            print("Введите число!")
+    
+    while True:
+        try:
+            quality = int(input("Качество JPEG (1-100, 85 рекомендуется): ") or 85)
+            if 1 <= quality <= 100:
+                break
+            print("Введите значение от 1 до 100")
+        except ValueError:
+            print("Введите число!")
+    
+    convert_all = input("Конвертировать все в JPEG (y/n)? ").lower() == 'y'
+    
+    return input_folder, output_folder, max_side, quality, convert_all
+
+def main():
+    input_folder, output_folder, max_side, quality, convert_all = get_user_input()
+    
+    print(f"\nНастройки обработки:")
+    print(f"- Папка с исходными файлами: {input_folder}")
+    print(f"- Папка для результатов: {output_folder}")
+    print(f"- Макс. размер: {max_side}px")
+    print(f"- Качество JPEG: {quality}%")
+    print(f"- Конвертировать все в JPEG: {'Да' if convert_all else 'Нет'}")
+    
+    # Обработка файлов
+    processed = {'fb2': 0, 'epub': 0, 'other': 0}
+    for filename in os.listdir(input_folder):
+        input_path = os.path.join(input_folder, filename)
+        output_path = os.path.join(output_folder, filename)
+        
+        if filename.lower().endswith('.fb2'):
+            if process_fb2_file(input_path, output_path, max_side, quality, convert_all):
+                processed['fb2'] += 1
+        elif filename.lower().endswith('.epub'):
+            if process_epub_file(input_path, output_path, max_side, quality, convert_all):
+                processed['epub'] += 1
+        else:
+            processed['other'] += 1
+    
+    print(f"\nОбработка завершена!")
+    print(f"- Обработано FB2: {processed['fb2']}")
+    print(f"- Обработано EPUB: {processed['epub']}")
+    print(f"- Пропущено других файлов: {processed['other']}")
+    print(f"Результаты сохранены в: {output_folder}")
+    input("Нажмите Enter для выхода...")
+
+if __name__ == "__main__":
+    main()
